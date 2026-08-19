@@ -1,0 +1,5 @@
+# dsh-image-path-fallback bundle patch
+# 单包单插件：装一次，设置页「图片降级」开关。
+- insert:
+    - id: dsh-image-path-fallback
+      name: '@dsh-external/dsh-image-path-fallback'
