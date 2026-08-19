@@ -1,5 +1,7 @@
 # @dsh-external/dsh-image-path-fallback
 
+> 仓库：https://github.com/SakuraChiyo0v0/dsh-image-path-fallback
+
 DSH 插件：当当前模型不支持图片输入时，自动把用户发送的图片降级为**本地文件路径 + 提示文本**，让纯文本模型也能借助识图 skill 读取图片。
 
 不需要修改 DeepSeek Harness 核心源码。
