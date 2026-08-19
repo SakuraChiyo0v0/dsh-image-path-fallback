@@ -3,10 +3,9 @@
  *
  * 宿主侧插件：
  * 1. 包装 ctx.llm.resolveModelInfo，让不支持图片的模型在准入阶段“看起来支持图片”
- *    （否则核心 api-proxy 会在入口直接拒绝）。
- * 2. 监听 agent/pre-step，在真实模型调用前把 image block 替换成“图片文件路径 + 提示”，
- *    让纯文本模型也能借助识图 skill 读取图片。
- * 3. 提供设置页开关，持久化到 ~/.dsh/dsh-image-path-fallback/settings.json。
+ * 2. 监听 agent/pre-step，把 image block 替换成可自定义的文案；可选模式：仅给文件路径，
+ *    或调用一个可识图模型的子代理分析图片后把结果文本注入主对话。
+ * 3. 设置页开关与模板配置持久化到 ~/.dsh/dsh-image-path-fallback/settings.json。
  */
 
 import type { Context } from 'cordis'
@@ -19,7 +18,7 @@ import { homedir } from 'node:os'
 import z from 'schemastery'
 
 export const name = '@dsh-external/dsh-image-path-fallback'
-export const inject = ['connection', 'llm', 'attachments']
+export const inject = ['connection', 'llm', 'attachments', 'subagents']
 
 export interface Config {
   enabled: boolean
@@ -41,6 +40,27 @@ const MEDIA_EXT: Record<string, string> = {
   'image/gif': '.gif',
 }
 
+interface Settings {
+  enabled: boolean
+  mode: 'path' | 'subagent'
+  template: string
+  visionProvider: string
+  visionModel: string
+  subagentPrompt: string
+}
+
+const DEFAULT_SETTINGS: Settings = {
+  enabled: true,
+  mode: 'path',
+  template:
+    '[用户发来一张图片，已保存到: {filePath}]\n'
+    + '请使用你的识图 skill（或可用的图片读取工具）读取该文件，获取图片内容后继续回答。',
+  visionProvider: '',
+  visionModel: '',
+  subagentPrompt:
+    '请分析这张图片并详细描述其内容，供一个不支持视觉的模型参考。图片文件路径：{filePath}',
+}
+
 function dshHome(): string {
   return process.env.DSH_HOME || join(homedir(), '.dsh')
 }
@@ -49,19 +69,19 @@ function settingsPath(): string {
   return join(dshHome(), 'dsh-image-path-fallback', 'settings.json')
 }
 
-async function readEnabled(): Promise<boolean> {
+async function readSettings(): Promise<Settings> {
   try {
-    const raw = JSON.parse(await readFile(settingsPath(), 'utf8')) as { enabled?: unknown }
-    return raw.enabled !== false
+    const raw = JSON.parse(await readFile(settingsPath(), 'utf8')) as Partial<Settings>
+    return { ...DEFAULT_SETTINGS, ...raw }
   } catch {
-    return true
+    return { ...DEFAULT_SETTINGS }
   }
 }
 
-async function writeEnabled(enabled: boolean): Promise<void> {
+async function writeSettings(settings: Settings): Promise<void> {
   const file = settingsPath()
   await mkdir(dirname(file), { recursive: true })
-  await writeFile(file, JSON.stringify({ enabled }, null, 2), 'utf8')
+  await writeFile(file, JSON.stringify(settings, null, 2), 'utf8')
 }
 
 function isImageCapable(info: { inputModalities?: readonly string[] } | undefined): boolean {
@@ -73,8 +93,9 @@ function patchModelCapability(ctx: Context): () => void {
   const llm = (ctx as unknown as { llm: { resolveModelInfo: (...args: unknown[]) => Promise<{ inputModalities?: readonly string[] }> } }).llm
   const original = llm.resolveModelInfo.bind(llm)
   llm.resolveModelInfo = (async (provider: string, model: string, signal?: AbortSignal) => {
+    const settings = await readSettings()
     const info = await original(provider, model, signal)
-    if (!(await readEnabled())) return info
+    if (!settings.enabled) return info
     if (!isImageCapable(info)) {
       return { ...info, inputModalities: [...(info.inputModalities ?? []), 'image'] }
     }
@@ -85,16 +106,67 @@ function patchModelCapability(ctx: Context): () => void {
   }
 }
 
-/** Map attachment media type to a file extension. */
 function extensionFor(mediaType: string): string {
   return MEDIA_EXT[mediaType] ?? (extname(mediaType) || '.img')
 }
 
-/** Convert image blocks in one user message to text file-path notes. */
+function renderTemplate(template: string, vars: Record<string, string>): string {
+  let text = template
+  for (const [key, value] of Object.entries(vars)) {
+    text = text.replaceAll(`{${key}}`, value)
+  }
+  return text
+}
+
+/** Run a one-shot vision subagent and return its text output. */
+async function runVisionSubagent(
+  ctx: Context,
+  parentAgent: unknown,
+  signal: AbortSignal | undefined,
+  filePath: string,
+  settings: Settings,
+): Promise<string> {
+  const subagents = (ctx as unknown as {
+    subagents: {
+      start(
+        provider: string,
+        request: {
+          label?: string
+          prompt: Array<{ type: 'text'; text: string }>
+          parent: unknown
+          signal?: AbortSignal
+          agentOptions?: { provider: string; model: string }
+        },
+      ): Promise<{ result: Promise<{ output: Array<{ type: string; text?: string }> }> }>
+    }
+  }).subagents
+  const run = await subagents.start('spawn', {
+    label: 'image-fallback-vision',
+    prompt: [{ type: 'text', text: renderTemplate(settings.subagentPrompt, { filePath }) }],
+    parent: parentAgent,
+    signal,
+    agentOptions: {
+      provider: settings.visionProvider,
+      model: settings.visionModel,
+    },
+  })
+  const result = await run.result
+  const text = (result.output ?? [])
+    .filter((block): block is { type: 'text'; text: string } => block.type === 'text' && typeof block.text === 'string')
+    .map(block => block.text)
+    .join('\n')
+    .trim()
+  return text || '（视觉子代理没有返回文本内容）'
+}
+
+/** Convert image blocks in one user message to text file-path notes / subagent analysis. */
 async function convertMessageImages(
   ctx: Context,
   message: { content: readonly unknown[] },
   baseDir: string,
+  parentAgent: unknown,
+  signal: AbortSignal | undefined,
+  settings: Settings,
 ): Promise<{ content: unknown[] }> {
   const content = message.content as Array<{ type: string; attachment?: { attachmentId: string; mediaType: string } }>
   let changed = false
@@ -112,12 +184,26 @@ async function convertMessageImages(
     const safeId = String(ref.attachmentId).replace(/[^a-zA-Z0-9]/g, '_')
     const filePath = join(dir, `${safeId}${extensionFor(ref.mediaType)}`)
     await writeFile(filePath, stored.data)
-    next.push({
-      type: 'text',
-      text:
-        `[用户发来一张图片，已保存到: ${filePath}]\n`
-        + `请使用你的识图 skill（或可用的图片读取工具）读取该文件，获取图片内容后继续回答。`,
-    })
+
+    if (settings.mode === 'subagent' && settings.visionProvider && settings.visionModel) {
+      let analysis = ''
+      try {
+        analysis = await runVisionSubagent(ctx, parentAgent, signal, filePath, settings)
+      } catch (error) {
+        analysis = `（视觉子代理分析失败：${error instanceof Error ? error.message : String(error)}）`
+      }
+      next.push({
+        type: 'text',
+        text:
+          `[用户发来一张图片，已保存到: ${filePath}]\n`
+          + `[视觉子代理分析结果]\n${analysis}`,
+      })
+    } else {
+      next.push({
+        type: 'text',
+        text: renderTemplate(settings.template, { filePath }),
+      })
+    }
     changed = true
   }
   return changed ? { content: next } : { content }
@@ -152,12 +238,17 @@ function installRpc(ctx: Context): () => void {
     async (endpoint: string, payload: Record<string, unknown>) => {
       try {
         if (endpoint === RPC_GET) {
-          return ok({ enabled: await readEnabled() })
+          return ok(await readSettings())
         }
         if (endpoint === RPC_SET) {
-          const enabled = payload.enabled === true
-          await writeEnabled(enabled)
-          return ok({ enabled })
+          const current = await readSettings()
+          const next: Settings = {
+            ...current,
+            ...(payload as Partial<Settings>),
+            mode: payload.mode === 'subagent' ? 'subagent' : 'path',
+          }
+          await writeSettings(next)
+          return ok(next)
         }
         return fail('bad-request', `Unknown endpoint: ${endpoint}`)
       } catch (error) {
@@ -173,17 +264,23 @@ export function apply(ctx: Context, _config: Config): void {
   const disposers: Array<() => void> = []
 
   {
-    // 让核心 api-proxy 的图片准入检查放行（内部按开关动态生效）
     disposers.push(patchModelCapability(ctx))
 
-    // 在模型真正调用前把 image block 替换成文件路径（内部按开关动态生效）
     disposers.push(ctx.on('agent/pre-step', (async (payload: any, next: any) => {
-      if (!(await readEnabled())) return next()
+      const settings = await readSettings()
+      if (!settings.enabled) return next()
       const baseDir = payload?.agent?.session?.header?.cwd ?? dshHome()
       const converted: Array<{ content: unknown[] }> = []
       let changed = false
       for (const message of payload?.messages ?? []) {
-        const result = await convertMessageImages(ctx, message, baseDir)
+        const result = await convertMessageImages(
+          ctx,
+          message,
+          baseDir,
+          payload?.agent,
+          payload?.signal,
+          settings,
+        )
         if (result.content !== message.content) changed = true
         converted.push({ ...message, content: result.content })
       }
