@@ -66,11 +66,16 @@ pnpm dsh plugin --profile web add @dsh-external/dsh-image-path-fallback@<version
 
 ### 子代理模式
 
-配置一个支持视觉的模型（Provider + Model），插件会自动：
+插件会自动：
 
 1. 保存图片到工作区
 2. 启动一个 `spawn` 子代理，使用视觉模型分析图片
 3. 把子代理返回的文本结果注入主对话
+
+Provider / Model 可以：
+
+- **留空**：自动从 DSH 系统已注册的模型里找第一个声明支持图片输入的模型
+- **手动指定**：填写具体的 Provider + Model
 
 子代理提示词同样支持 `{filePath}` 占位符。
 

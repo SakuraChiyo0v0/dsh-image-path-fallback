@@ -118,6 +118,27 @@ function renderTemplate(template: string, vars: Record<string, string>): string 
   return text
 }
 
+/** Auto-select the first model in the system catalog that declares image input. */
+async function findVisionModel(ctx: Context): Promise<{ provider: string; model: string } | null> {
+  const llm = (ctx as unknown as {
+    llm: {
+      listProviders(): Array<{ id: string }>
+      listModels(provider: string): Promise<Array<{ id: string; inputModalities?: readonly string[] }>>
+    }
+  }).llm
+  try {
+    for (const provider of llm.listProviders()) {
+      const models = await llm.listModels(provider.id).catch(() => [])
+      for (const model of models) {
+        if (model.inputModalities?.includes('image') === true) {
+          return { provider: provider.id, model: model.id }
+        }
+      }
+    }
+  } catch { /* ignore */ }
+  return null
+}
+
 /** Run a one-shot vision subagent and return its text output. */
 async function runVisionSubagent(
   ctx: Context,
@@ -140,15 +161,22 @@ async function runVisionSubagent(
       ): Promise<{ result: Promise<{ output: Array<{ type: string; text?: string }> }> }>
     }
   }).subagents
+  let provider = settings.visionProvider
+  let model = settings.visionModel
+  if (!provider || !model) {
+    const auto = await findVisionModel(ctx)
+    if (auto === null) {
+      throw new Error('未找到支持图片输入的系统模型；请在设置中手动填写视觉 Provider/Model')
+    }
+    provider = auto.provider
+    model = auto.model
+  }
   const run = await subagents.start('spawn', {
     label: 'image-fallback-vision',
     prompt: [{ type: 'text', text: renderTemplate(settings.subagentPrompt, { filePath }) }],
     parent: parentAgent,
     signal,
-    agentOptions: {
-      provider: settings.visionProvider,
-      model: settings.visionModel,
-    },
+    agentOptions: { provider, model },
   })
   const result = await run.result
   const text = (result.output ?? [])
